@@ -6,7 +6,7 @@ use crate::types::{ExecuteRequest, ExecuteResponse, MAX_BODY_BYTES};
 use anyhow::{Context, Result, bail};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -243,7 +243,9 @@ impl Sandbox {
     fn launch(&mut self, cfg: &SandboxConfig) -> Result<()> {
         let filter = seccomp::write_filter(&self.run_dir.join("seccomp.bpf"))?;
         let log = File::create(self.run_dir.join("launcher.log"))?;
-        let mut cmd = Command::new("bwrap");
+        let host_binary = std::env::current_exe().context("locating host launcher binary")?;
+        let mut cmd = Command::new(host_binary);
+        cmd.arg("launcher");
         cmd.args([
             "--unshare-all",
             "--unshare-user",
@@ -287,17 +289,19 @@ impl Sandbox {
             "executor",
             "/run/mini-sandbox/executor.sock",
         ]);
-        cmd.stdin(Stdio::null())
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
-        let child = cmd.spawn().context("launching bubblewrap")?;
-        // The task is not dispatched until cgroup attachment and socket readiness.
-        // bubblewrap setup can briefly run before attachment; production threat models
-        // requiring atomic attachment should use clone3(CLONE_INTO_CGROUP).
+        let child = cmd.spawn().context("launching gated cgroup trampoline")?;
         let pid = child.id();
         self.child = Some(child);
+        // The trampoline blocks on stdin, so no bwrap descendants can exist yet.
         fs::write(self.cgroup.join("cgroup.procs"), pid.to_string())
-            .context("attaching launcher to cgroup")?;
+            .context("attaching gated launcher to cgroup")?;
+        let gate = self.child.as_mut().and_then(|c| c.stdin.as_mut())
+            .context("launcher gate pipe missing")?;
+        gate.write_all(&[0xAC]).context("releasing gated launcher")?;
+        self.child.as_mut().expect("launcher exists").stdin.take();
         Ok(())
     }
 

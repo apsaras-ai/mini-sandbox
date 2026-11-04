@@ -3,7 +3,10 @@ compile_error!("mini-sandbox supports Linux hosts only");
 
 use anyhow::{Context, Result};
 use mini_sandbox::{api, executor, sandbox::SandboxConfig};
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -16,8 +19,29 @@ async fn shutdown_signal() {
     }
 }
 
+fn main() -> Result<()> {
+    // A tiny synchronous trampoline blocks before exec(bwrap) until the host
+    // attaches this PID to its cgroup. No user process can evade membership.
+    if std::env::args().nth(1).as_deref() == Some("launcher") {
+        let mut token = [0u8; 1];
+        std::io::stdin()
+            .read_exact(&mut token)
+            .context("waiting for host cgroup attachment")?;
+        if token != [0xAC] {
+            anyhow::bail!("invalid launcher release token");
+        }
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        let err = Command::new("bwrap")
+            .args(args)
+            .stdin(Stdio::null())
+            .exec();
+        return Err(err).context("execing bubblewrap after cgroup attachment");
+    }
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
