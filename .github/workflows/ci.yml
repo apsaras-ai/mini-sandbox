@@ -32,5 +32,6 @@ jobs:
           sudo apt-get install -y -qq nodejs
           test -x /usr/bin/node
       - run: cargo fmt --all -- --check
+      - run: sudo apt-get update && sudo apt-get install -y nodejs
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
