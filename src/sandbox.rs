@@ -368,6 +368,19 @@ impl Sandbox {
                 result.oom_killed = self.oom_killed();
                 Ok(result)
             }
+            Err(_err) if self.oom_killed() => Ok(ExecuteResponse {
+                stdout: String::new(),
+                stderr: "sandbox killed by cgroup memory limit".to_owned(),
+                exit_code: 137,
+                duration_ms: started.elapsed().as_millis() as u64,
+                timed_out: false,
+                peak_memory_bytes: fs::read_to_string(self.cgroup.join("memory.peak"))
+                    .ok()
+                    .and_then(|x| x.trim().parse().ok())
+                    .unwrap_or(0),
+                output_truncated: false,
+                oom_killed: true,
+            }),
             Err(_err) if Instant::now() >= deadline => Ok(ExecuteResponse::timeout(
                 started.elapsed().as_millis() as u64,
             )),

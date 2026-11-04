@@ -110,3 +110,15 @@ bash scripts/smoke-linux.sh
    privileged host facilities and should additionally exercise OOM, fork
    bombs, background process cleanup, filesystem isolation, network denial,
    and forced service termination before claiming production readiness.
+
+## Linux end-to-end acceptance
+
+After building the rootfs and starting the service on an appropriately privileged
+Linux host, run `python3 scripts/acceptance-linux.py`. It checks success/failure,
+Python/Node, file and environment injection, deadlines, output overflow, disk
+quota, network denial, request validation, cross-run isolation, background process
+cleanup, overload and cgroup OOM. Run the service with
+`MINI_SANDBOX_MAX_CONCURRENCY=1` for the overload assertion. GitHub Actions also
+contains a Linux integration workflow; if the hosted runner lacks delegated
+cgroup or namespace privileges, treat that as an environment limitation rather
+than bypassing the checks.

@@ -1,0 +1,47 @@
+name: Linux sandbox end-to-end
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install launcher requirements
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap docker.io curl
+          docker version
+      - name: Build a pinned Ubuntu rootfs and host service
+        run: |
+          sudo bash scripts/build-rootfs.sh
+          cargo build --release
+      - name: Run isolated execution acceptance suite
+        run: |
+          sudo env MINI_SANDBOX_MAX_CONCURRENCY=1 ./target/release/mini-sandbox >service.log 2>&1 &
+          service_pid=$!
+          trap 'sudo kill "$service_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for i in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:3000/readyz >/dev/null; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$service_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          test "$ready" -eq 1 || { cat service.log; exit 1; }
+          python3 scripts/acceptance-linux.py
+      - name: Print service diagnostics on failure
+        if: failure()
+        run: |
+          tail -n 160 service.log 2>/dev/null || true
+          sudo find /var/lib/mini-sandbox/runs -maxdepth 2 -type f -name 'launcher.log' -exec sh -c 'echo "---- $1"; cat "$1"' _ {} \; 2>/dev/null || true
+          mount | grep mini-sandbox || true
