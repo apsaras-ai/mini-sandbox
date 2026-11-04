@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -16,31 +16,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Apply rustfmt (one-time bootstrap)
-        run: |
-          cargo fmt --all
-          if ! git diff --quiet && [ "$GITHUB_REF" = "refs/heads/master" ]; then
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git config user.name "github-actions[bot]"
-            git add src
-            git commit -m "style: rustfmt sources"
-            git push origin HEAD:master
-          fi
       - name: Ensure system Node.js path for executor tests
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq nodejs
           test -x /usr/bin/node
       - run: cargo fmt --all -- --check
-      - run: cargo test --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
-      - name: Commit dependency lockfile (one-time bootstrap)
-        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-        run: |
-          git add Cargo.lock
-          if ! git diff --cached --quiet; then
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git config user.name "github-actions[bot]"
-            git commit -m "build: lock Rust dependencies"
-            git push origin HEAD:master
-          fi
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
