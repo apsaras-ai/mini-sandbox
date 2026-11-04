@@ -1,29 +1,19 @@
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::collections::HashSet;
+use std::path::{Component, Path};
 
-// ==================== Sandbox 状态 ====================
-//
-// 一个 sandbox 实例的生命周期：
-//   Warming → Idle → Running → Dead
-//
-// Warming: 正在创建 namespace、挂载文件系统等初始化工作
-// Idle:    初始化完成，空闲等待任务分配
-// Running: 正在执行用户代码
-// Dead:    已失效（崩溃、超时、用完），等待清理
+pub const MAX_CODE_BYTES: usize = 128 * 1024;
+pub const MAX_FILE_BYTES: usize = 512 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SandboxState {
-    Warming,
-    Idle,
-    Running,
-    Dead,
+fn default_timeout() -> u64 {
+    5_000
 }
 
-// ==================== 执行请求 ====================
-//
-// 外部 （比如 AI Agent） 通过 API 发送执行请求
-// 用 Deserialize 让 axum 自动解析为这个结构体
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteRequest {
     pub code: String,
     pub language: String,
@@ -35,59 +25,129 @@ pub struct ExecuteRequest {
     pub env_vars: Vec<(String, String)>,
 }
 
-fn default_timeout() -> u64 {
-    5_000
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileInput {
     pub path: String,
     #[serde(with = "base64_bytes")]
     pub content: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteResponse {
-    pub stdout: String, 
+    pub stdout: String,
     pub stderr: String,
-    pub exit_code:i32,
+    pub exit_code: i32,
     pub duration_ms: u64,
     pub timed_out: bool,
     pub peak_memory_bytes: u64,
+    #[serde(default)]
+    pub output_truncated: bool,
+    #[serde(default)]
+    pub oom_killed: bool,
 }
 
-// ==================== Sandbox 实例 ====================
-//
-// 代表一个正在运行的隔离沙箱。
-// 不需要序列化——这是纯内部状态。
-
-pub struct Sandbox {
-    pub id: String,
-    pub state: SandboxState,
-    pub pid: u32,
-    pub created_at: Instant,
-    pub last_used: Instant,
-    // 资源路径--销毁时需要依次清理这些
-    pub cgroup_path: String, // /sys/fs/cgroup/mini-sandbox/{id}
-    pub upper_dir: String, // OverlayFS 的写入层
-    pub work_dir: String, // OverlayFS 的工作目录
-    pub merged_dir: String, // OverlayFS 的合并挂载点
+impl ExecuteResponse {
+    pub fn timeout(duration_ms: u64) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: "sandbox execution deadline exceeded".to_owned(),
+            exit_code: -1,
+            duration_ms,
+            timed_out: true,
+            peak_memory_bytes: 0,
+            output_truncated: false,
+            oom_killed: false,
+        }
+    }
 }
 
-// ==================== 辅助：base64 编码的文件内容 ====================
-//
-// HTTP JSON 不能直接传二进制，所以文件内容用 base64 编码。
-// 这个模块让 serde 自动处理 base64 ↔ Vec<u8> 转换。
+impl ExecuteRequest {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.language.as_str(), "python" | "node" | "nodejs") {
+            bail!("language must be python, node or nodejs");
+        }
+        if self.code.is_empty() || self.code.len() > MAX_CODE_BYTES {
+            bail!("code must contain 1..={MAX_CODE_BYTES} bytes");
+        }
+        if !(1..=30_000).contains(&self.timeout_ms) {
+            bail!("timeout_ms must be between 1 and 30000");
+        }
+        if self.files.len() > 64 {
+            bail!("too many input files");
+        }
+        let mut total = 0usize;
+        let mut paths = HashSet::new();
+        for file in &self.files {
+            let path = Path::new(&file.path);
+            if file.path.is_empty()
+                || file.path.len() > 256
+                || !path.components().all(|c| matches!(c, Component::Normal(_)))
+                || file.path.contains('\\')
+                || file.path.contains('\0')
+            {
+                bail!("file paths must be relative with no '.' or '..' components");
+            }
+            if file.path == "__mini_sandbox_main__.py"
+                || file.path == "__mini_sandbox_main__.js"
+            {
+                bail!("reserved input file path");
+            }
+            if !paths.insert(file.path.as_str()) {
+                bail!("duplicate input file path");
+            }
+            total = total.checked_add(file.content.len()).ok_or_else(|| anyhow::anyhow!("input size overflow"))?;
+            if total > MAX_FILE_BYTES {
+                bail!("input files exceed {MAX_FILE_BYTES} bytes");
+            }
+        }
+        for path in &paths {
+            let mut ancestor = Path::new(path).parent();
+            while let Some(dir) = ancestor {
+                if paths.contains(dir.to_str().unwrap_or_default()) {
+                    bail!("input file is also a parent directory");
+                }
+                ancestor = dir.parent().filter(|p| !p.as_os_str().is_empty());
+            }
+        }
+        if self.env_vars.len() > 32 {
+            bail!("too many environment variables");
+        }
+        let mut keys = HashSet::new();
+        for (key, value) in &self.env_vars {
+            let valid = !key.is_empty()
+                && key.len() <= 64
+                && (key.as_bytes()[0].is_ascii_alphabetic() || key.starts_with('_'))
+                && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if !valid || value.len() > 4096 || value.contains('\0') || !keys.insert(key) {
+                bail!("invalid or duplicate environment variable");
+            }
+            let upper = key.to_ascii_uppercase();
+            if upper == "PATH"
+                || upper == "HOME"
+                || upper == "TMPDIR"
+                || upper == "ENV"
+                || upper == "BASH_ENV"
+                || upper.starts_with("LD_")
+                || upper.starts_with("PYTHON")
+                || upper.starts_with("NODE_")
+            {
+                bail!("environment variable {key} is reserved");
+            }
+        }
+        Ok(())
+    }
+}
 
 mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use serde::de::Error;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(&base64_encode(bytes))
+        serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -95,90 +155,7 @@ mod base64_bytes {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        base64_decode(&s).map_err(D::Error::custom)
-    }
-
-    fn base64_encode(input: &[u8]) -> String {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut result = String::new();
-        for chunk in input.chunks(3) {
-            match chunk.len() {
-                3 => {
-                    let n = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | chunk[2] as u32;
-                    result.push(TABLE[(n >> 18 & 0x3F) as usize] as char);
-                    result.push(TABLE[(n >> 12 & 0x3F) as usize] as char);
-                    result.push(TABLE[(n >> 6 & 0x3F) as usize] as char);
-                    result.push(TABLE[(n & 0x3F) as usize] as char);
-                }
-                2 => {
-                    let n = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8;
-                    result.push(TABLE[(n >> 18 & 0x3F) as usize] as char);
-                    result.push(TABLE[(n >> 12 & 0x3F) as usize] as char);
-                    result.push(TABLE[(n >> 6 & 0x3F) as usize] as char);
-                    result.push('=');
-                }
-                1 => {
-                    let n = (chunk[0] as u32) << 16;
-                    result.push(TABLE[(n >> 18 & 0x3F) as usize] as char);
-                    result.push(TABLE[(n >> 12 & 0x3F) as usize] as char);
-                    result.push('=');
-                    result.push('=');
-                }
-                _ => {}
-            }
-        }
-        result
-    }
-
-    fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-        // 简易 base64 解码，生产环境应使用 base64 crate
-        let input = input.trim();
-        if input.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-        let mut buf = Vec::new();
-        let bytes: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
-        let chunks = bytes.chunks(4);
-
-        for chunk in chunks {
-            let mut bits: u32 = 0;
-            let mut valid = 0;
-
-            for &c in chunk {
-                if c == b'=' {
-                    break;
-                }
-                let val = TABLE.iter().position(|&t| t == c)
-                    .ok_or_else(|| format!("invalid base64 char: {}", c as char))?;
-                bits = (bits << 6) | val as u32;
-                valid += 1;
-            }
-
-            match valid {
-                4 => {
-                    buf.push((bits >> 16) as u8);
-                    buf.push((bits >> 8) as u8);
-                    buf.push(bits as u8);
-                }
-                3 => {
-                    bits <<= 6;
-                    buf.push((bits >> 16) as u8);
-                    buf.push((bits >> 8) as u8);
-                }
-                2 => {
-                    bits <<= 12;
-                    buf.push((bits >> 16) as u8);
-                }
-                _ => return Err("invalid base64 length".to_string()),
-            }
-        }
-
-        Ok(buf)
+        STANDARD.decode(s.as_bytes()).map_err(D::Error::custom)
     }
 }
 
@@ -187,51 +164,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_execution_request_basic() {
-        let json = r#"{
-            "code": "print('hello')",
-            "language": "python"
-        }"#;
-        let req: ExecutionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.code, "print('hello')");
-        assert_eq!(req.language, "python");
-        assert_eq!(req.timeout_ms, 5000); // 默认值
-        assert!(req.files.is_empty());
-        assert!(req.env_vars.is_empty());
+    fn request_roundtrip_and_default_timeout() {
+        let req: ExecuteRequest = serde_json::from_str(r#"{"code":"print(1)","language":"python","files":[{"path":"hello.txt","content":"aGk="}]}"#).unwrap();
+        assert_eq!(req.timeout_ms, 5000);
+        assert_eq!(req.files[0].content, b"hi");
+        req.validate().unwrap();
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("aGk="));
     }
 
     #[test]
-    fn parse_execution_request_full() {
-        let json = r#"{
-            "code": "console.log(1)",
-            "language": "node",
-            "timeout_ms": 3000,
-            "env_vars": [["API_KEY", "abc123"]]
-        }"#;
-        let req: ExecutionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.timeout_ms, 3000);
-        assert_eq!(req.env_vars[0], ("API_KEY".to_string(), "abc123".to_string()));
+    fn response_serialization() {
+        let response = ExecuteResponse::timeout(3000);
+        assert_eq!(serde_json::to_value(&response).unwrap()["timed_out"], true);
     }
 
     #[test]
-    fn serialize_execution_response() {
-        let resp = ExecutionResponse {
-            stdout: "2\n".to_string(),
-            stderr: String::new(),
-            exit_code: 0,
-            duration_ms: 45,
-            timed_out: false,
-            peak_memory_bytes: 1024,
+    fn rejects_traversal_and_reserved_env() {
+        let mut req = ExecuteRequest {
+            code: "print(1)".into(),
+            language: "python".into(),
+            timeout_ms: 5000,
+            files: vec![FileInput { path: "../outside".into(), content: vec![] }],
+            env_vars: vec![],
         };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["stdout"], "2\n");
-        assert_eq!(json["exit_code"], 0);
-        assert_eq!(json["timed_out"], false);
-    }
-
-    #[test]
-    fn sandbox_state_equality() {
-        assert_eq!(SandboxState::Idle, SandboxState::Idle);
-        assert_ne!(SandboxState::Idle, SandboxState::Running);
+        assert!(req.validate().is_err());
+        req.files[0].path = "dir/file".into();
+        req.env_vars.push(("LD_PRELOAD".into(), "x".into()));
+        assert!(req.validate().is_err());
     }
 }

@@ -1,98 +1,175 @@
-// executor.rs — Service 层的 executor 客户端
-//
-// 这段代码运行在 sandbox 外部（宿主机上的 Service 进程里）。
-// 它通过 OverlayFS 的穿透特性，直接访问 sandbox 内部 executor 创建的 Unix Socket。
-//
-// 通信路径：
-//   Sandbox 内部: executor 监听 /run/executor.sock
-//                      ↓ (通过 OverlayFS，socket 文件实际落在 upper_dir)
-//   宿主机实际位置: {upper_dir}/run/executor.sock
-//                      ↑ (客户端直接连接这个路径)
-//   Service 层:   本文件的 execute_in_sandbox() 函数
-
+use crate::protocol;
+use crate::types::{ExecuteRequest, ExecuteResponse, MAX_BODY_BYTES, MAX_OUTPUT_BYTES};
 use anyhow::{Context, Result};
-use tokio::net::UnixStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::net::UnixListener;
+use tokio::process::Command;
+use tokio::task::JoinHandle;
 
-use crate::types::{ExecutionRequest, ExecutionResponse};
-
-/// 将代码发送到 sandbox 内的 executor 执行, 返回结果
-/// 
-/// `upper_dir` 是 OverlayFS 的 upper 目录路径 （宿主机上的真实路径）
-/// executor 在sandbox 内部监听 /run/executor.sock 文件
-/// 但由于 OverlayF 穿透，这个 socket 实际出现在 {upper_dir}/run/executor.sock
-pub async fn execute_in_sandbox(
-    upper_dir: &str,
-    request: &ExecuteRequest,
-) -> Result<ExecuteResponse> {
-    // 1. 构造 socket 路径
-    let sock_path: PathBuf = [upper_dir, "run", "executor.sock"].iter().collect();
-
-    // 2. 连接 executor (异步 unix socket)
-    let mut stream = UnixStream::connect(&sock_path)
-        .await
-        .with_context(|| format!("failed to connect executor at {:?}", sock_path))?;
-       
-    // 3. 发送执行请求
-    send_request(&mut stream, request).await?;
-
-    // 4. 接收响应
-    let response = receive_response(&mut stream).await?;
-
-    // 5. 返回结果
-    Ok(response)
-}
-
-
-pub async fn execute_in_sandbox_with_timeout(
-    upper_dir: &str,
-    request: &ExecuteRequest,
-    timeout: Duration,
-) -> Result<ExecuteResponse> {
-    // 1. 创建一个定时器
-    let timeout_handle = tokio::time::timeout(timeout, execute_in_sandbox(upper_dir, request));
-    // 2. 等待执行完成或超时
-    timeout_handle.await.map_err(|_| anyhow::anyhow!("execution timed out"))?
-        .map_err(|e| anyhow::anyhow!("execution failed: {}", e))?
-}
-
-// ==================== 长度前缀协议（异步版本） ====================
-//
-// 和 bin/executor.rs 中的同步版本使用完全相同的协议格式：
-//   [4 bytes: u32 big-endian] [JSON body]
-//
-// 区别是这里用 tokio 的 AsyncRead/AsyncWrite。
-
-async fn send_request(stream: &mut UnixStream, request: &ExecuteRequest) -> Result<()> {
-    // 1. 序列化请求
-    let body = serde_json::to_vec(request).with_context(|| "failed to serialize request")?;
-    let len = body.len() as u32;
-    // 2. 发送请求
-    stream.write_all(&len.to_be_bytes()).await?;
-    // 3. 发送 body
-    stream.write_all(&body).await?;
-    // 4. 等待发送完成
-    stream.flush().await?;
-
+pub async fn serve(socket: &Path) -> Result<()> {
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("binding executor socket {}", socket.display()))?;
+    let (mut stream, _) = listener.accept().await?;
+    let req: ExecuteRequest = protocol::receive(&mut stream, MAX_BODY_BYTES).await?;
+    req.validate()?;
+    let result = execute(&req, Path::new("/workspace")).await?;
+    protocol::send(&mut stream, &result, MAX_BODY_BYTES).await?;
     Ok(())
 }
 
-async fn receive_response(stream: &mut UnixStream) -> Result<ExecuteResponse> {
-    // 1. 接收长度
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+async fn read_capped<R: AsyncRead + Unpin>(
+    mut reader: R,
+    used: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+) -> Vec<u8> {
+    let mut collected = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let prior = used.fetch_add(n, Ordering::Relaxed);
+                let remaining = MAX_OUTPUT_BYTES.saturating_sub(prior);
+                collected.extend_from_slice(&chunk[..n.min(remaining)]);
+                if n > remaining {
+                    exceeded.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+    collected
+}
 
-    // 安全检查： 防止恶意 executor 发来巨大长度导致 OOM
-    if len > 10 * 1024 * 1024 {
-        anyhow::bail!("response too large: {} bytes", len);
+async fn collect(mut task: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match tokio::time::timeout(Duration::from_millis(300), &mut task).await {
+        Ok(Ok(buf)) => buf,
+        _ => {
+            task.abort();
+            Vec::new()
+        }
+    }
+}
+
+pub async fn execute(req: &ExecuteRequest, workspace: &Path) -> Result<ExecuteResponse> {
+    req.validate()?;
+    let script = if req.language == "python" {
+        workspace.join("__mini_sandbox_main__.py")
+    } else {
+        workspace.join("__mini_sandbox_main__.js")
+    };
+    for file in &req.files {
+        let target = workspace.join(&file.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, &file.content)?;
+    }
+    std::fs::write(&script, &req.code)?;
+    let start = Instant::now();
+    let (program, args): (&str, &[&str]) = if req.language == "python" {
+        ("/usr/bin/python3", &["-B", "-u"])
+    } else {
+        ("/usr/bin/node", &[])
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .arg(&script)
+        .current_dir(workspace)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/workspace")
+        .env("TMPDIR", "/tmp")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in &req.env_vars {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().context("starting language interpreter")?;
+    let used = Arc::new(AtomicUsize::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let stdout = tokio::spawn(read_capped(
+        child.stdout.take().expect("stdout configured as piped"),
+        used.clone(),
+        exceeded.clone(),
+    ));
+    let stderr = tokio::spawn(read_capped(
+        child.stderr.take().expect("stderr configured as piped"),
+        used,
+        exceeded.clone(),
+    ));
+    let exit = loop {
+        if exceeded.load(Ordering::Relaxed) {
+            let _ = child.start_kill();
+            break child.wait().await?;
+        }
+        if let Some(exit) = child.try_wait()? {
+            break exit;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let stdout = collect(stdout).await;
+    let stderr = collect(stderr).await;
+    Ok(ExecuteResponse {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code: exit.code().unwrap_or(-1),
+        duration_ms: start.elapsed().as_millis() as u64,
+        timed_out: false,
+        peak_memory_bytes: 0,
+        output_truncated: exceeded.load(Ordering::Relaxed),
+        oom_killed: false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn request(language: &str, code: &str) -> ExecuteRequest {
+        ExecuteRequest {
+            language: language.into(),
+            code: code.into(),
+            timeout_ms: 3000,
+            files: vec![],
+            env_vars: vec![],
+        }
     }
 
-    // 2. 接收 body
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await?;
-    let response = serde_json::from_slice(&body).with_context(|| "failed to deserialize response")?;
-    Ok(response)
+    #[tokio::test]
+    async fn python_success_and_nonzero_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let success = execute(&request("python", "print('ok')"), temp.path()).await.unwrap();
+        assert_eq!(success.exit_code, 0);
+        assert_eq!(success.stdout.trim(), "ok");
+        let fail = execute(&request("python", "raise ValueError('bad')"), temp.path()).await.unwrap();
+        assert_ne!(fail.exit_code, 0);
+        assert!(fail.stderr.contains("ValueError"));
+    }
+
+    #[tokio::test]
+    async fn node_and_file_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut req = request("node", "console.log(require('fs').readFileSync('x.txt','utf8'))");
+        req.files.push(crate::types::FileInput { path: "x.txt".into(), content: b"loaded".to_vec() });
+        let result = execute(&req, temp.path()).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout.trim(), "loaded");
+    }
+
+    #[tokio::test]
+    async fn output_cap_is_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let res = execute(&request("python", "print('x' * 200000)"), temp.path()).await.unwrap();
+        assert!(res.output_truncated);
+        assert!(res.stdout.len() <= MAX_OUTPUT_BYTES);
+    }
 }
