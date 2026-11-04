@@ -1,7 +1,7 @@
 use crate::protocol;
 use crate::types::{ExecuteRequest, ExecuteResponse, MAX_BODY_BYTES, MAX_OUTPUT_BYTES};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},

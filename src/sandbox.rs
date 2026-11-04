@@ -267,7 +267,7 @@ impl Sandbox {
                 result.oom_killed = self.oom_killed();
                 Ok(result)
             }
-            Err(err) if Instant::now() >= deadline => {
+            Err(_err) if Instant::now() >= deadline => {
                 Ok(ExecuteResponse::timeout(started.elapsed().as_millis() as u64))
             }
             Err(err) => Err(err).context("receiving executor response"),
