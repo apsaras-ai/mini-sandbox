@@ -298,9 +298,13 @@ impl Sandbox {
         // The trampoline blocks on stdin, so no bwrap descendants can exist yet.
         fs::write(self.cgroup.join("cgroup.procs"), pid.to_string())
             .context("attaching gated launcher to cgroup")?;
-        let gate = self.child.as_mut().and_then(|c| c.stdin.as_mut())
+        let gate = self
+            .child
+            .as_mut()
+            .and_then(|c| c.stdin.as_mut())
             .context("launcher gate pipe missing")?;
-        gate.write_all(&[0xAC]).context("releasing gated launcher")?;
+        gate.write_all(&[0xAC])
+            .context("releasing gated launcher")?;
         self.child.as_mut().expect("launcher exists").stdin.take();
         Ok(())
     }

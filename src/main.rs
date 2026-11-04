@@ -31,10 +31,7 @@ fn main() -> Result<()> {
             anyhow::bail!("invalid launcher release token");
         }
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
-        let err = Command::new("bwrap")
-            .args(args)
-            .stdin(Stdio::null())
-            .exec();
+        let err = Command::new("bwrap").args(args).stdin(Stdio::null()).exec();
         return Err(err).context("execing bubblewrap after cgroup attachment");
     }
     async_main()
