@@ -15,7 +15,7 @@ jobs:
       - name: Install launcher requirements
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap docker.io curl
+          sudo apt-get install -y -qq bubblewrap curl
           docker version
       - name: Build a pinned Ubuntu rootfs and host service
         run: |
