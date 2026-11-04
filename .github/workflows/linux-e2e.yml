@@ -2,6 +2,13 @@ name: Linux sandbox end-to-end
 on:
   push:
     branches: [master]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rootfs/**'
+      - 'scripts/**'
+      - '.github/workflows/linux-e2e.yml'
   workflow_dispatch:
 
 jobs:

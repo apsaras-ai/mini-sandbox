@@ -34,3 +34,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Commit dependency lockfile (one-time bootstrap)
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          git add Cargo.lock
+          if ! git diff --cached --quiet; then
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config user.name "github-actions[bot]"
+            git commit -m "build: lock Rust dependencies"
+            git push origin HEAD:master
+          fi
