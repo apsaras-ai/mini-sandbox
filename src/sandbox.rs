@@ -32,9 +32,11 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         let data_dir = std::env::var_os("MINI_SANDBOX_DATA_DIR")
-            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/lib/mini-sandbox"));
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/mini-sandbox"));
         let rootfs = std::env::var_os("MINI_SANDBOX_ROOTFS")
-            .map(PathBuf::from).unwrap_or_else(|| data_dir.join("rootfs"));
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("rootfs"));
         Self {
             data_dir,
             rootfs,
@@ -52,17 +54,27 @@ pub fn prerequisites(cfg: &SandboxConfig) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("the sandbox service requires root for tmpfs and cgroup v2 setup");
     }
-    for binary in ["usr/bin/python3", "usr/bin/node", "usr/local/bin/mini-sandbox"] {
+    for binary in [
+        "usr/bin/python3",
+        "usr/bin/node",
+        "usr/local/bin/mini-sandbox",
+    ] {
         if !cfg.rootfs.join(binary).is_file() {
             bail!("rootfs missing {binary}; run scripts/build-rootfs.sh");
         }
     }
-    if !cfg.cgroup_base.parent().unwrap_or(Path::new("/sys/fs/cgroup"))
-        .join("cgroup.controllers").is_file()
+    if !cfg
+        .cgroup_base
+        .parent()
+        .unwrap_or(Path::new("/sys/fs/cgroup"))
+        .join("cgroup.controllers")
+        .is_file()
     {
         bail!("cgroup v2 unified hierarchy is required");
     }
-    let bwrap = Command::new("bwrap").arg("--version").output()
+    let bwrap = Command::new("bwrap")
+        .arg("--version")
+        .output()
         .context("bubblewrap (bwrap) is required on the host")?;
     if !bwrap.status.success() {
         bail!("bubblewrap --version failed");
@@ -73,7 +85,10 @@ pub fn prerequisites(cfg: &SandboxConfig) -> Result<()> {
 pub fn acquire_service_lock(cfg: &SandboxConfig) -> Result<File> {
     fs::create_dir_all(&cfg.data_dir)?;
     fs::set_permissions(&cfg.data_dir, Permissions::from_mode(0o700))?;
-    let lock = OpenOptions::new().write(true).create(true).open(cfg.data_dir.join("service.lock"))?;
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(cfg.data_dir.join("service.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error()).context("another mini-sandbox service is running");
     }
@@ -81,19 +96,26 @@ pub fn acquire_service_lock(cfg: &SandboxConfig) -> Result<File> {
 }
 
 fn configure_cgroup_base(cfg: &SandboxConfig) -> Result<()> {
-    fs::create_dir_all(&cfg.cgroup_base).context("creating cgroup base; check cgroup delegation")?;
+    fs::create_dir_all(&cfg.cgroup_base)
+        .context("creating cgroup base; check cgroup delegation")?;
     let controllers = fs::read_to_string(cfg.cgroup_base.join("cgroup.controllers"))?;
     for controller in ["cpu", "memory", "pids"] {
         if !controllers.split_whitespace().any(|c| c == controller) {
-            bail!("cgroup controller {controller} not delegated to {}", cfg.cgroup_base.display());
+            bail!(
+                "cgroup controller {controller} not delegated to {}",
+                cfg.cgroup_base.display()
+            );
         }
     }
     // Parent has no member processes; controllers propagate to child cgroups.
     let enabled = fs::read_to_string(cfg.cgroup_base.join("cgroup.subtree_control"))?;
     for controller in ["cpu", "memory", "pids"] {
         if !enabled.split_whitespace().any(|c| c == controller) {
-            fs::write(cfg.cgroup_base.join("cgroup.subtree_control"), format!("+{controller}"))
-                .with_context(|| format!("enabling {controller} cgroup controller"))?;
+            fs::write(
+                cfg.cgroup_base.join("cgroup.subtree_control"),
+                format!("+{controller}"),
+            )
+            .with_context(|| format!("enabling {controller} cgroup controller"))?;
         }
     }
     Ok(())
@@ -124,7 +146,9 @@ pub fn recover_orphans(cfg: &SandboxConfig) -> Result<()> {
             mounted: true,
             cleaned: false,
         };
-        sandbox.reap_orphan().with_context(|| format!("reaping orphan {id}"))?;
+        sandbox
+            .reap_orphan()
+            .with_context(|| format!("reaping orphan {id}"))?;
     }
     Ok(())
 }
@@ -166,24 +190,39 @@ impl Sandbox {
         let cgroup = cfg.cgroup_base.join(&id);
         fs::DirBuilder::new().mode(0o700).create(&run_dir)?;
         let mut guard = Self {
-            run_dir, workspace, ipc, cgroup, child: None,
-            mounted: false, cleaned: false,
+            run_dir,
+            workspace,
+            ipc,
+            cgroup,
+            child: None,
+            mounted: false,
+            cleaned: false,
         };
         fs::create_dir(&guard.workspace)?;
         fs::create_dir(&guard.ipc)?;
         fs::set_permissions(&guard.ipc, Permissions::from_mode(0o777))?;
         let options = format!("size={},mode=1777", cfg.disk_bytes);
-        mount(Some("tmpfs"), &guard.workspace, Some("tmpfs"),
+        mount(
+            Some("tmpfs"),
+            &guard.workspace,
+            Some("tmpfs"),
             MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-            Some(options.as_str())).context("mounting quota-limited tmpfs")?;
+            Some(options.as_str()),
+        )
+        .context("mounting quota-limited tmpfs")?;
         guard.mounted = true;
         fs::create_dir(&guard.cgroup).context("creating cgroup")?;
-        fs::write(guard.cgroup.join("memory.max"), cfg.memory_bytes.to_string())?;
+        fs::write(
+            guard.cgroup.join("memory.max"),
+            cfg.memory_bytes.to_string(),
+        )?;
         fs::write(guard.cgroup.join("memory.swap.max"), "0")?;
         fs::write(guard.cgroup.join("memory.oom.group"), "1")?;
         fs::write(guard.cgroup.join("pids.max"), cfg.max_pids.to_string())?;
-        fs::write(guard.cgroup.join("cpu.max"),
-            format!("{} {}", cfg.cpu_quota_us, cfg.cpu_period_us))?;
+        fs::write(
+            guard.cgroup.join("cpu.max"),
+            format!("{} {}", cfg.cpu_quota_us, cfg.cpu_period_us),
+        )?;
         guard.launch(cfg)?;
         Ok(guard)
     }
@@ -193,11 +232,22 @@ impl Sandbox {
         let log = File::create(self.run_dir.join("launcher.log"))?;
         let mut cmd = Command::new("bwrap");
         cmd.args([
-            "--unshare-all", "--disable-userns", "--new-session", "--die-with-parent",
-            "--cap-drop", "ALL", "--clearenv",
-            "--setenv", "PATH", "/usr/bin:/bin",
-            "--setenv", "HOME", "/workspace",
-            "--setenv", "LANG", "C.UTF-8",
+            "--unshare-all",
+            "--disable-userns",
+            "--new-session",
+            "--die-with-parent",
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "HOME",
+            "/workspace",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
             "--ro-bind",
         ]);
         cmd.arg(&cfg.rootfs).arg("/");
@@ -208,9 +258,16 @@ impl Sandbox {
         cmd.args(["--dir", "/run", "--dir", "/run/mini-sandbox"]);
         cmd.arg("--bind").arg(&self.ipc).arg("/run/mini-sandbox");
         cmd.arg("--seccomp").arg(filter.as_raw_fd().to_string());
-        cmd.args(["--chdir", "/workspace", "/usr/local/bin/mini-sandbox",
-            "executor", "/run/mini-sandbox/executor.sock"]);
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(log));
+        cmd.args([
+            "--chdir",
+            "/workspace",
+            "/usr/local/bin/mini-sandbox",
+            "executor",
+            "/run/mini-sandbox/executor.sock",
+        ]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
         let child = cmd.spawn().context("launching bubblewrap")?;
         // The task is not dispatched until cgroup attachment and socket readiness.
         // bubblewrap setup can briefly run before attachment; production threat models
@@ -222,21 +279,31 @@ impl Sandbox {
         Ok(())
     }
 
-    fn run(&mut self, req: &ExecuteRequest, deadline: Instant, started: Instant)
-        -> Result<ExecuteResponse>
-    {
+    fn run(
+        &mut self,
+        req: &ExecuteRequest,
+        deadline: Instant,
+        started: Instant,
+    ) -> Result<ExecuteResponse> {
         let socket = self.ipc.join("executor.sock");
         let startup_deadline = Instant::now() + Duration::from_secs(5);
         let mut stream = loop {
             if Instant::now() >= deadline {
-                return Ok(ExecuteResponse::timeout(started.elapsed().as_millis() as u64));
+                return Ok(ExecuteResponse::timeout(
+                    started.elapsed().as_millis() as u64
+                ));
             }
             if Instant::now() >= startup_deadline {
                 bail!("executor startup timed out; see launcher.log");
             }
             match UnixStream::connect(&socket) {
                 Ok(stream) => break stream,
-                Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
                     if let Some(child) = self.child.as_mut() {
                         if let Some(status) = child.try_wait()? {
                             bail!("bubblewrap exited before readiness with status {status}");
@@ -250,12 +317,18 @@ impl Sandbox {
         let remaining = deadline.saturating_duration_since(Instant::now());
         stream.set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
         if let Err(err) = protocol::send_sync(&mut stream, req, MAX_BODY_BYTES) {
-            if Instant::now() >= deadline { return Ok(ExecuteResponse::timeout(started.elapsed().as_millis() as u64)); }
+            if Instant::now() >= deadline {
+                return Ok(ExecuteResponse::timeout(
+                    started.elapsed().as_millis() as u64
+                ));
+            }
             return Err(err).context("sending executor request");
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(ExecuteResponse::timeout(started.elapsed().as_millis() as u64));
+            return Ok(ExecuteResponse::timeout(
+                started.elapsed().as_millis() as u64
+            ));
         }
         stream.set_read_timeout(Some(remaining))?;
         let result: Result<ExecuteResponse> = protocol::receive_sync(&mut stream, MAX_BODY_BYTES);
@@ -263,23 +336,29 @@ impl Sandbox {
             Ok(mut result) => {
                 result.duration_ms = started.elapsed().as_millis() as u64;
                 result.peak_memory_bytes = fs::read_to_string(self.cgroup.join("memory.peak"))
-                    .ok().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+                    .ok()
+                    .and_then(|x| x.trim().parse().ok())
+                    .unwrap_or(0);
                 result.oom_killed = self.oom_killed();
                 Ok(result)
             }
-            Err(_err) if Instant::now() >= deadline => {
-                Ok(ExecuteResponse::timeout(started.elapsed().as_millis() as u64))
-            }
+            Err(_err) if Instant::now() >= deadline => Ok(ExecuteResponse::timeout(
+                started.elapsed().as_millis() as u64,
+            )),
             Err(err) => Err(err).context("receiving executor response"),
         }
     }
 
     fn oom_killed(&self) -> bool {
-        fs::read_to_string(self.cgroup.join("memory.events")).ok()
-            .map(|content| content.lines().any(|line| {
-                line.split_once(' ')
-                    .is_some_and(|(key, n)| key == "oom_kill" && n.trim().parse::<u64>().unwrap_or(0) > 0)
-            }))
+        fs::read_to_string(self.cgroup.join("memory.events"))
+            .ok()
+            .map(|content| {
+                content.lines().any(|line| {
+                    line.split_once(' ').is_some_and(|(key, n)| {
+                        key == "oom_kill" && n.trim().parse::<u64>().unwrap_or(0) > 0
+                    })
+                })
+            })
             .unwrap_or(false)
     }
 
@@ -291,7 +370,9 @@ impl Sandbox {
     }
 
     fn wait_empty(&self) -> Result<()> {
-        if !self.cgroup.exists() { return Ok(()); }
+        if !self.cgroup.exists() {
+            return Ok(());
+        }
         for _ in 0..100 {
             let events = fs::read_to_string(self.cgroup.join("cgroup.events"))?;
             if events.lines().any(|line| line.trim() == "populated 0") {
@@ -303,7 +384,9 @@ impl Sandbox {
     }
 
     fn cleanup(&mut self) -> Result<()> {
-        if self.cleaned { return Ok(()); }
+        if self.cleaned {
+            return Ok(());
+        }
         self.kill_cgroup()?;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -328,8 +411,8 @@ impl Sandbox {
         self.kill_cgroup()?;
         self.wait_empty()?;
         match umount2(&self.workspace, MntFlags::empty()) {
-            Ok(()) => {},
-            Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {},
+            Ok(()) => {}
+            Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {}
             Err(err) => return Err(err).context("unmounting orphan workspace"),
         }
         self.mounted = false;

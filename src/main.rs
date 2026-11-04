@@ -19,8 +19,10 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "mini_sandbox=info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "mini_sandbox=info".into()),
+        )
         .init();
 
     let mut args = std::env::args().skip(1);
@@ -40,10 +42,11 @@ async fn main() -> Result<()> {
     let _service_lock = mini_sandbox::sandbox::acquire_service_lock(&cfg)?;
     mini_sandbox::sandbox::recover_orphans(&cfg)?;
     let max_concurrency = std::env::var("MINI_SANDBOX_MAX_CONCURRENCY")
-        .ok().and_then(|n| n.parse::<usize>().ok())
-        .filter(|n| (1..=128).contains(n)).unwrap_or(4);
-    let addr = std::env::var("MINI_SANDBOX_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:3000".into());
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|n| (1..=128).contains(n))
+        .unwrap_or(4);
+    let addr = std::env::var("MINI_SANDBOX_LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, max_concurrency, "mini-sandbox service ready");
     axum::serve(listener, api::router(cfg, max_concurrency))

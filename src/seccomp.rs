@@ -13,7 +13,12 @@ const AUDIT_ARCH: u32 = 0xc000_003e;
 const AUDIT_ARCH: u32 = 0xc000_00b7;
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
-    libc::sock_filter { code, jt: 0, jf: 0, k }
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
@@ -41,7 +46,12 @@ pub fn write_filter(path: &Path) -> Result<File> {
         | libc::CLONE_NEWNET
         | libc::CLONE_NEWCGROUP) as u32;
     p.extend([
-        jump((BPF_JMP | BPF_JEQ | BPF_K) as u16, libc::SYS_clone as u32, 0, 4),
+        jump(
+            (BPF_JMP | BPF_JEQ | BPF_K) as u16,
+            libc::SYS_clone as u32,
+            0,
+            4,
+        ),
         stmt((BPF_LD | BPF_W | BPF_ABS) as u16, 16), // arg0 low 32 bits
         stmt((BPF_ALU | BPF_AND | BPF_K) as u16, namespace_flags),
         jump((BPF_JMP | BPF_JEQ | BPF_K) as u16, 0, 1, 0),
@@ -50,27 +60,57 @@ pub fn write_filter(path: &Path) -> Result<File> {
     ]);
     // clone3 should return ENOSYS, allowing glibc to fall back to clone.
     p.extend([
-        jump((BPF_JMP | BPF_JEQ | BPF_K) as u16, libc::SYS_clone3 as u32, 0, 1),
+        jump(
+            (BPF_JMP | BPF_JEQ | BPF_K) as u16,
+            libc::SYS_clone3 as u32,
+            0,
+            1,
+        ),
         stmt((BPF_RET | BPF_K) as u16, ERRNO | libc::ENOSYS as u32),
     ]);
     let blocked: &[libc::c_long] = &[
-        libc::SYS_mount, libc::SYS_umount2, libc::SYS_pivot_root,
-        libc::SYS_ptrace, libc::SYS_bpf, libc::SYS_perf_event_open,
-        libc::SYS_keyctl, libc::SYS_add_key, libc::SYS_request_key,
-        libc::SYS_init_module, libc::SYS_finit_module, libc::SYS_delete_module,
-        libc::SYS_kexec_load, libc::SYS_reboot, libc::SYS_swapon,
-        libc::SYS_swapoff, libc::SYS_userfaultfd, libc::SYS_open_by_handle_at,
-        libc::SYS_unshare, libc::SYS_setns, libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter, libc::SYS_io_uring_register,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_ptrace,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_userfaultfd,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ];
     for syscall in blocked {
-        p.push(jump((BPF_JMP | BPF_JEQ | BPF_K) as u16, *syscall as u32, 0, 1));
+        p.push(jump(
+            (BPF_JMP | BPF_JEQ | BPF_K) as u16,
+            *syscall as u32,
+            0,
+            1,
+        ));
         p.push(stmt((BPF_RET | BPF_K) as u16, deny));
     }
     p.push(stmt((BPF_RET | BPF_K) as u16, ALLOW));
 
-    let mut file = OpenOptions::new().write(true).read(true).create_new(true).mode(0o600)
-        .open(path).with_context(|| format!("creating seccomp filter {}", path.display()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating seccomp filter {}", path.display()))?;
     // sock_filter has a fixed Linux C layout: u16,u8,u8,u32.
     let bytes = unsafe {
         std::slice::from_raw_parts(

@@ -147,10 +147,14 @@ mod tests {
     #[tokio::test]
     async fn python_success_and_nonzero_exit() {
         let temp = tempfile::tempdir().unwrap();
-        let success = execute(&request("python", "print('ok')"), temp.path()).await.unwrap();
+        let success = execute(&request("python", "print('ok')"), temp.path())
+            .await
+            .unwrap();
         assert_eq!(success.exit_code, 0);
         assert_eq!(success.stdout.trim(), "ok");
-        let fail = execute(&request("python", "raise ValueError('bad')"), temp.path()).await.unwrap();
+        let fail = execute(&request("python", "raise ValueError('bad')"), temp.path())
+            .await
+            .unwrap();
         assert_ne!(fail.exit_code, 0);
         assert!(fail.stderr.contains("ValueError"));
     }
@@ -158,8 +162,14 @@ mod tests {
     #[tokio::test]
     async fn node_and_file_input() {
         let temp = tempfile::tempdir().unwrap();
-        let mut req = request("node", "console.log(require('fs').readFileSync('x.txt','utf8'))");
-        req.files.push(crate::types::FileInput { path: "x.txt".into(), content: b"loaded".to_vec() });
+        let mut req = request(
+            "node",
+            "console.log(require('fs').readFileSync('x.txt','utf8'))",
+        );
+        req.files.push(crate::types::FileInput {
+            path: "x.txt".into(),
+            content: b"loaded".to_vec(),
+        });
         let result = execute(&req, temp.path()).await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout.trim(), "loaded");
@@ -168,7 +178,9 @@ mod tests {
     #[tokio::test]
     async fn output_cap_is_enforced() {
         let temp = tempfile::tempdir().unwrap();
-        let res = execute(&request("python", "print('x' * 200000)"), temp.path()).await.unwrap();
+        let res = execute(&request("python", "print('x' * 200000)"), temp.path())
+            .await
+            .unwrap();
         assert!(res.output_truncated);
         assert!(res.stdout.len() <= MAX_OUTPUT_BYTES);
     }

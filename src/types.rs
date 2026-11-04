@@ -88,15 +88,15 @@ impl ExecuteRequest {
             {
                 bail!("file paths must be relative with no '.' or '..' components");
             }
-            if file.path == "__mini_sandbox_main__.py"
-                || file.path == "__mini_sandbox_main__.js"
-            {
+            if file.path == "__mini_sandbox_main__.py" || file.path == "__mini_sandbox_main__.js" {
                 bail!("reserved input file path");
             }
             if !paths.insert(file.path.as_str()) {
                 bail!("duplicate input file path");
             }
-            total = total.checked_add(file.content.len()).ok_or_else(|| anyhow::anyhow!("input size overflow"))?;
+            total = total
+                .checked_add(file.content.len())
+                .ok_or_else(|| anyhow::anyhow!("input size overflow"))?;
             if total > MAX_FILE_BYTES {
                 bail!("input files exceed {MAX_FILE_BYTES} bytes");
             }
@@ -185,7 +185,10 @@ mod tests {
             code: "print(1)".into(),
             language: "python".into(),
             timeout_ms: 5000,
-            files: vec![FileInput { path: "../outside".into(), content: vec![] }],
+            files: vec![FileInput {
+                path: "../outside".into(),
+                content: vec![],
+            }],
             env_vars: vec![],
         };
         assert!(req.validate().is_err());
