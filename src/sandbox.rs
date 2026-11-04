@@ -317,7 +317,13 @@ impl Sandbox {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    if let Some(status) = self.child.as_mut().map(|c| c.try_wait()).transpose()?.flatten() {
+                    if let Some(status) = self
+                        .child
+                        .as_mut()
+                        .map(|c| c.try_wait())
+                        .transpose()?
+                        .flatten()
+                    {
                         bail!("bubblewrap exited before readiness with status {status}");
                     }
                     thread::sleep(Duration::from_millis(15));
