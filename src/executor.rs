@@ -37,7 +37,9 @@ async fn read_capped<R: AsyncRead + Unpin>(
                 let prior = used.fetch_add(n, Ordering::Relaxed);
                 let remaining = MAX_OUTPUT_BYTES.saturating_sub(prior);
                 if remaining > 0 {
-                    buffer.lock().expect("capture buffer poisoned")
+                    buffer
+                        .lock()
+                        .expect("capture buffer poisoned")
                         .extend_from_slice(&chunk[..n.min(remaining)]);
                 }
                 if n > remaining {
