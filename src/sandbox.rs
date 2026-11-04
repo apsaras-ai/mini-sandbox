@@ -88,6 +88,7 @@ pub fn acquire_service_lock(cfg: &SandboxConfig) -> Result<File> {
     let lock = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(cfg.data_dir.join("service.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error()).context("another mini-sandbox service is running");
@@ -144,6 +145,7 @@ pub fn recover_orphans(cfg: &SandboxConfig) -> Result<()> {
             cgroup: cfg.cgroup_base.join(id.as_ref()),
             child: None,
             mounted: true,
+            ipc_mounted: true,
             cleaned: false,
         };
         sandbox
@@ -177,6 +179,7 @@ struct Sandbox {
     cgroup: PathBuf,
     child: Option<Child>,
     mounted: bool,
+    ipc_mounted: bool,
     cleaned: bool,
 }
 
@@ -196,11 +199,21 @@ impl Sandbox {
             cgroup,
             child: None,
             mounted: false,
+            ipc_mounted: false,
             cleaned: false,
         };
         fs::create_dir(&guard.workspace)?;
         fs::create_dir(&guard.ipc)?;
-        fs::set_permissions(&guard.ipc, Permissions::from_mode(0o777))?;
+        let ipc_options = "size=1048576,mode=1777";
+        mount(
+            Some("tmpfs"),
+            &guard.ipc,
+            Some("tmpfs"),
+            MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some(ipc_options),
+        )
+        .context("mounting quota-limited IPC tmpfs")?;
+        guard.ipc_mounted = true;
         let options = format!("size={},mode=1777", cfg.disk_bytes);
         mount(
             Some("tmpfs"),
@@ -304,10 +317,8 @@ impl Sandbox {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    if let Some(child) = self.child.as_mut() {
-                        if let Some(status) = child.try_wait()? {
-                            bail!("bubblewrap exited before readiness with status {status}");
-                        }
+                    if let Some(status) = self.child.as_mut().map(|c| c.try_wait()).transpose()?.flatten() {
+                        bail!("bubblewrap exited before readiness with status {status}");
                     }
                     thread::sleep(Duration::from_millis(15));
                 }
@@ -394,8 +405,12 @@ impl Sandbox {
         }
         self.wait_empty()?;
         if self.mounted {
-            umount2(&self.workspace, MntFlags::empty()).context("unmounting sandbox tmpfs")?;
+            umount2(&self.workspace, MntFlags::empty()).context("unmounting workspace tmpfs")?;
             self.mounted = false;
+        }
+        if self.ipc_mounted {
+            umount2(&self.ipc, MntFlags::empty()).context("unmounting IPC tmpfs")?;
+            self.ipc_mounted = false;
         }
         if self.cgroup.exists() {
             fs::remove_dir(&self.cgroup).context("removing cgroup")?;
@@ -416,17 +431,24 @@ impl Sandbox {
             Err(err) => return Err(err).context("unmounting orphan workspace"),
         }
         self.mounted = false;
+        match umount2(&self.ipc, MntFlags::empty()) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {}
+            Err(err) => return Err(err).context("unmounting orphan IPC"),
+        }
+        self.ipc_mounted = false;
         self.cleanup()
     }
 }
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if !self.cleaned {
-            if let Err(err) = self.cleanup() {
-                error!(error = %err, run_dir = %self.run_dir.display(),
-                    "sandbox cleanup failed; orphan recovery required");
-            }
+        if self.cleaned {
+            return;
+        }
+        if let Err(err) = self.cleanup() {
+            error!(error = %err, run_dir = %self.run_dir.display(),
+                "sandbox cleanup failed; orphan recovery required");
         }
     }
 }
