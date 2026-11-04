@@ -246,7 +246,16 @@ impl Sandbox {
         let mut cmd = Command::new("bwrap");
         cmd.args([
             "--unshare-all",
+            "--unshare-user",
+            "--unshare-cgroup",
             "--disable-userns",
+            "--assert-userns-disabled",
+            "--uid",
+            "65534",
+            "--gid",
+            "65534",
+            "--hostname",
+            "mini-sandbox",
             "--new-session",
             "--die-with-parent",
             "--cap-drop",
