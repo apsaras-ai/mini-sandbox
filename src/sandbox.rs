@@ -6,7 +6,7 @@ use crate::types::{ExecuteRequest, ExecuteResponse, MAX_BODY_BYTES};
 use anyhow::{Context, Result, bail};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -88,6 +88,7 @@ pub fn acquire_service_lock(cfg: &SandboxConfig) -> Result<File> {
     let lock = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(cfg.data_dir.join("service.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error()).context("another mini-sandbox service is running");
@@ -144,6 +145,7 @@ pub fn recover_orphans(cfg: &SandboxConfig) -> Result<()> {
             cgroup: cfg.cgroup_base.join(id.as_ref()),
             child: None,
             mounted: true,
+            ipc_mounted: true,
             cleaned: false,
         };
         sandbox
@@ -177,6 +179,7 @@ struct Sandbox {
     cgroup: PathBuf,
     child: Option<Child>,
     mounted: bool,
+    ipc_mounted: bool,
     cleaned: bool,
 }
 
@@ -196,11 +199,21 @@ impl Sandbox {
             cgroup,
             child: None,
             mounted: false,
+            ipc_mounted: false,
             cleaned: false,
         };
         fs::create_dir(&guard.workspace)?;
         fs::create_dir(&guard.ipc)?;
-        fs::set_permissions(&guard.ipc, Permissions::from_mode(0o777))?;
+        let ipc_options = "size=1048576,mode=1777";
+        mount(
+            Some("tmpfs"),
+            &guard.ipc,
+            Some("tmpfs"),
+            MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some(ipc_options),
+        )
+        .context("mounting quota-limited IPC tmpfs")?;
+        guard.ipc_mounted = true;
         let options = format!("size={},mode=1777", cfg.disk_bytes);
         mount(
             Some("tmpfs"),
@@ -230,10 +243,21 @@ impl Sandbox {
     fn launch(&mut self, cfg: &SandboxConfig) -> Result<()> {
         let filter = seccomp::write_filter(&self.run_dir.join("seccomp.bpf"))?;
         let log = File::create(self.run_dir.join("launcher.log"))?;
-        let mut cmd = Command::new("bwrap");
+        let host_binary = std::env::current_exe().context("locating host launcher binary")?;
+        let mut cmd = Command::new(host_binary);
+        cmd.arg("launcher");
         cmd.args([
             "--unshare-all",
+            "--unshare-user",
+            "--unshare-cgroup",
             "--disable-userns",
+            "--assert-userns-disabled",
+            "--uid",
+            "65534",
+            "--gid",
+            "65534",
+            "--hostname",
+            "mini-sandbox",
             "--new-session",
             "--die-with-parent",
             "--cap-drop",
@@ -265,17 +289,23 @@ impl Sandbox {
             "executor",
             "/run/mini-sandbox/executor.sock",
         ]);
-        cmd.stdin(Stdio::null())
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
-        let child = cmd.spawn().context("launching bubblewrap")?;
-        // The task is not dispatched until cgroup attachment and socket readiness.
-        // bubblewrap setup can briefly run before attachment; production threat models
-        // requiring atomic attachment should use clone3(CLONE_INTO_CGROUP).
+        let child = cmd.spawn().context("launching gated cgroup trampoline")?;
         let pid = child.id();
         self.child = Some(child);
+        // The trampoline blocks on stdin, so no bwrap descendants can exist yet.
         fs::write(self.cgroup.join("cgroup.procs"), pid.to_string())
-            .context("attaching launcher to cgroup")?;
+            .context("attaching gated launcher to cgroup")?;
+        let gate = self
+            .child
+            .as_mut()
+            .and_then(|c| c.stdin.as_mut())
+            .context("launcher gate pipe missing")?;
+        gate.write_all(&[0xAC])
+            .context("releasing gated launcher")?;
+        self.child.as_mut().expect("launcher exists").stdin.take();
         Ok(())
     }
 
@@ -304,10 +334,14 @@ impl Sandbox {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    if let Some(child) = self.child.as_mut() {
-                        if let Some(status) = child.try_wait()? {
-                            bail!("bubblewrap exited before readiness with status {status}");
-                        }
+                    if let Some(status) = self
+                        .child
+                        .as_mut()
+                        .map(|c| c.try_wait())
+                        .transpose()?
+                        .flatten()
+                    {
+                        bail!("bubblewrap exited before readiness with status {status}");
                     }
                     thread::sleep(Duration::from_millis(15));
                 }
@@ -342,6 +376,19 @@ impl Sandbox {
                 result.oom_killed = self.oom_killed();
                 Ok(result)
             }
+            Err(_err) if self.oom_killed() => Ok(ExecuteResponse {
+                stdout: String::new(),
+                stderr: "sandbox killed by cgroup memory limit".to_owned(),
+                exit_code: 137,
+                duration_ms: started.elapsed().as_millis() as u64,
+                timed_out: false,
+                peak_memory_bytes: fs::read_to_string(self.cgroup.join("memory.peak"))
+                    .ok()
+                    .and_then(|x| x.trim().parse().ok())
+                    .unwrap_or(0),
+                output_truncated: false,
+                oom_killed: true,
+            }),
             Err(_err) if Instant::now() >= deadline => Ok(ExecuteResponse::timeout(
                 started.elapsed().as_millis() as u64,
             )),
@@ -394,8 +441,12 @@ impl Sandbox {
         }
         self.wait_empty()?;
         if self.mounted {
-            umount2(&self.workspace, MntFlags::empty()).context("unmounting sandbox tmpfs")?;
+            umount2(&self.workspace, MntFlags::empty()).context("unmounting workspace tmpfs")?;
             self.mounted = false;
+        }
+        if self.ipc_mounted {
+            umount2(&self.ipc, MntFlags::empty()).context("unmounting IPC tmpfs")?;
+            self.ipc_mounted = false;
         }
         if self.cgroup.exists() {
             fs::remove_dir(&self.cgroup).context("removing cgroup")?;
@@ -416,17 +467,24 @@ impl Sandbox {
             Err(err) => return Err(err).context("unmounting orphan workspace"),
         }
         self.mounted = false;
+        match umount2(&self.ipc, MntFlags::empty()) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => {}
+            Err(err) => return Err(err).context("unmounting orphan IPC"),
+        }
+        self.ipc_mounted = false;
         self.cleanup()
     }
 }
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if !self.cleaned {
-            if let Err(err) = self.cleanup() {
-                error!(error = %err, run_dir = %self.run_dir.display(),
-                    "sandbox cleanup failed; orphan recovery required");
-            }
+        if self.cleaned {
+            return;
+        }
+        if let Err(err) = self.cleanup() {
+            error!(error = %err, run_dir = %self.run_dir.display(),
+                "sandbox cleanup failed; orphan recovery required");
         }
     }
 }

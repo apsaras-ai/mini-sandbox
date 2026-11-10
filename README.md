@@ -92,10 +92,10 @@ bash scripts/smoke-linux.sh
 
 1. A privileged host service is **not** safe to expose publicly. Put it behind
    an authenticated internal Agent service, with its own request quotas.
-2. cgroup attachment happens immediately after spawning bubblewrap, **not
-   atomically in clone3**. User code is never dispatched before attachment,
-   but bubblewrap setup may momentarily run outside limits. This needs a
-   stronger launcher for hostile multi-tenant use.
+2. A synchronous launcher blocks on a pipe while the host attaches its PID to
+   cgroup v2, then execs bubblewrap. This keeps all namespace setup and
+   user-code descendants in the cgroup. It is not clone3(CLONE_INTO_CGROUP),
+   but removes the child-fork-before-attachment race.
 3. Seccomp is a denylist, not a complete syscall allowlist. The service uses
    the host Linux kernel. For untrusted Internet code, reevaluate against
    microVMs (Firecracker, Kata) and independent security review.
@@ -110,3 +110,15 @@ bash scripts/smoke-linux.sh
    privileged host facilities and should additionally exercise OOM, fork
    bombs, background process cleanup, filesystem isolation, network denial,
    and forced service termination before claiming production readiness.
+
+## Linux end-to-end acceptance
+
+After building the rootfs and starting the service on an appropriately privileged
+Linux host, run `python3 scripts/acceptance-linux.py`. It checks success/failure,
+Python/Node, file and environment injection, deadlines, output overflow, disk
+quota, network denial, request validation, cross-run isolation, background process
+cleanup, overload and cgroup OOM. Run the service with
+`MINI_SANDBOX_MAX_CONCURRENCY=1` for the overload assertion. GitHub Actions also
+contains a Linux integration workflow; if the hosted runner lacks delegated
+cgroup or namespace privileges, treat that as an environment limitation rather
+than bypassing the checks.

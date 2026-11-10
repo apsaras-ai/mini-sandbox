@@ -1,9 +1,9 @@
 # Build the executor on glibc older than or equal to the runtime rootfs.
 FROM rust:1.90-bookworm AS builder
 WORKDIR /src
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive

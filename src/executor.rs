@@ -3,7 +3,7 @@ use crate::types::{ExecuteRequest, ExecuteResponse, MAX_BODY_BYTES, MAX_OUTPUT_B
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -27,8 +27,8 @@ async fn read_capped<R: AsyncRead + Unpin>(
     mut reader: R,
     used: Arc<AtomicUsize>,
     exceeded: Arc<AtomicBool>,
-) -> Vec<u8> {
-    let mut collected = Vec::new();
+    buffer: Arc<Mutex<Vec<u8>>>,
+) {
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
@@ -36,7 +36,12 @@ async fn read_capped<R: AsyncRead + Unpin>(
             Ok(n) => {
                 let prior = used.fetch_add(n, Ordering::Relaxed);
                 let remaining = MAX_OUTPUT_BYTES.saturating_sub(prior);
-                collected.extend_from_slice(&chunk[..n.min(remaining)]);
+                if remaining > 0 {
+                    buffer
+                        .lock()
+                        .expect("capture buffer poisoned")
+                        .extend_from_slice(&chunk[..n.min(remaining)]);
+                }
                 if n > remaining {
                     exceeded.store(true, Ordering::Relaxed);
                     break;
@@ -44,17 +49,20 @@ async fn read_capped<R: AsyncRead + Unpin>(
             }
         }
     }
-    collected
 }
 
-async fn collect(mut task: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    match tokio::time::timeout(Duration::from_millis(300), &mut task).await {
-        Ok(Ok(buf)) => buf,
-        _ => {
-            task.abort();
-            Vec::new()
-        }
+async fn collect(mut task: JoinHandle<()>, buffer: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    if tokio::time::timeout(Duration::from_millis(300), &mut task)
+        .await
+        .is_err()
+    {
+        // Descendants may inherit pipe FDs after the main interpreter exits.
+        // Preserve bytes already captured instead of discarding the entire output.
+        task.abort();
+        let _ = task.await;
     }
+    let mut guard = buffer.lock().expect("capture buffer poisoned");
+    std::mem::take(&mut *guard)
 }
 
 pub async fn execute(req: &ExecuteRequest, workspace: &Path) -> Result<ExecuteResponse> {
@@ -97,15 +105,19 @@ pub async fn execute(req: &ExecuteRequest, workspace: &Path) -> Result<ExecuteRe
     let mut child = cmd.spawn().context("starting language interpreter")?;
     let used = Arc::new(AtomicUsize::new(0));
     let exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
     let stdout = tokio::spawn(read_capped(
         child.stdout.take().expect("stdout configured as piped"),
         used.clone(),
         exceeded.clone(),
+        stdout_buffer.clone(),
     ));
     let stderr = tokio::spawn(read_capped(
         child.stderr.take().expect("stderr configured as piped"),
         used,
         exceeded.clone(),
+        stderr_buffer.clone(),
     ));
     let exit = loop {
         if exceeded.load(Ordering::Relaxed) {
@@ -117,8 +129,8 @@ pub async fn execute(req: &ExecuteRequest, workspace: &Path) -> Result<ExecuteRe
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    let stdout = collect(stdout).await;
-    let stderr = collect(stderr).await;
+    let stdout = collect(stdout, stdout_buffer).await;
+    let stderr = collect(stderr, stderr_buffer).await;
     Ok(ExecuteResponse {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -173,6 +185,21 @@ mod tests {
         let result = execute(&req, temp.path()).await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout.trim(), "loaded");
+    }
+
+    #[tokio::test]
+    async fn preserves_output_with_inherited_pipe() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = execute(
+            &request(
+                "python",
+                "import subprocess;subprocess.Popen(['/bin/sleep','2']);print('ready')",
+            ),
+            temp.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stdout.trim(), "ready");
     }
 
     #[tokio::test]
